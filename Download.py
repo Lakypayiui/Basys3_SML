@@ -30,7 +30,18 @@ from transformers import AutoModelForCausalLM
 
 MAGIC = 0x54494E31  # "TIN1"
 
-# Tensores que son matrices de pesos usadas en matmul -> cuantizar Q4 por fila.
+# Tope maximo de grupos de scale por tensor. Con esto una matriz de 50257 filas
+# (wte, lm_head) no paga 50257 floats de scale -- paga a lo sumo MAX_GROUPS.
+# Matrices chicas (64-256 filas, ya por debajo del tope) siguen teniendo scale
+# por fila real, sin cambios respecto a la version anterior.
+#
+# Trade-off: bajar este numero ahorra mas ROM pero pierde granularidad de
+# cuantizacion en wte/lm_head (vuelve a acercarse al bug original de scale
+# global mientras mas chico sea). 512 es un punto de partida razonable;
+# si necesitas exprimir mas MB, probar 128 o 256 antes de ir mas abajo.
+MAX_GROUPS = 512
+
+# Tensores que son matrices de pesos usadas en matmul -> cuantizar Q4 por grupo.
 # Todo lo demas (bias, layernorm) se guarda en F32 plano.
 Q4_NAME_SUFFIXES = (
     "wte.weight",
@@ -49,11 +60,19 @@ def is_q4(name: str) -> bool:
     return any(name.endswith(suf) for suf in Q4_NAME_SUFFIXES)
 
 
-def quantize_row_int4(row: torch.Tensor):
-    """Cuantiza un vector 1D a INT4 con signo [-8, 7], devuelve (scale, valores_int8)."""
-    max_abs = row.abs().max().item()
+def choose_group_size(out_dim: int, max_groups: int = MAX_GROUPS) -> int:
+    """Cuantas filas consecutivas comparten un scale, para no superar max_groups
+    scales en total por tensor."""
+    num_groups = min(out_dim, max_groups)
+    return (out_dim + num_groups - 1) // num_groups
+
+
+def quantize_group_int4(rows: torch.Tensor):
+    """rows: [group_size, in_dim]. Cuantiza el grupo entero a INT4 con signo
+    [-8, 7] usando un unico scale para todas esas filas juntas."""
+    max_abs = rows.abs().max().item()
     scale = (max_abs / 7.0) if max_abs > 0 else 1.0
-    q = torch.round(row / scale).clamp(-8, 7).to(torch.int8)
+    q = torch.round(rows / scale).clamp(-8, 7).to(torch.int8)
     return scale, q
 
 
@@ -74,15 +93,22 @@ def pack_int4(rows_q: torch.Tensor):
 
 
 def write_q4_tensor(f, name: str, weight_2d: torch.Tensor):
-    """weight_2d: [out_dim, in_dim] en FP32. Cuantiza CADA FILA con su propio scale."""
+    """weight_2d: [out_dim, in_dim] en FP32. Cuantiza en grupos de
+    `group_size` filas consecutivas, cada grupo con su propio scale,
+    respetando el tope MAX_GROUPS scales por tensor."""
     out_dim, in_dim = weight_2d.shape
+    group_size = choose_group_size(out_dim)
+
     scales = []
-    quantized_rows = []
-    for o in range(out_dim):
-        scale, q_row = quantize_row_int4(weight_2d[o])
+    quantized_rows = [None] * out_dim
+    for start in range(0, out_dim, group_size):
+        end = min(start + group_size, out_dim)
+        scale, q_group = quantize_group_int4(weight_2d[start:end])
         scales.append(scale)
-        quantized_rows.append(q_row)
-    q_all = torch.stack(quantized_rows, dim=0)  # [out_dim, in_dim]
+        for offset, row_idx in enumerate(range(start, end)):
+            quantized_rows[row_idx] = q_group[offset]
+
+    q_all = torch.stack(quantized_rows, dim=0)  # [out_dim, in_dim], orden original
     packed = pack_int4(q_all)
 
     name_bytes = name.encode("utf-8")
@@ -91,8 +117,9 @@ def write_q4_tensor(f, name: str, weight_2d: torch.Tensor):
     f.write(struct.pack("<B", 0))  # type = 0 (Q4)
     total_size = out_dim * in_dim
     f.write(struct.pack("<I", total_size))
-    f.write(struct.pack("<I", out_dim))  # rows = cantidad de scales
-    f.write(struct.pack(f"<{out_dim}f", *scales))
+    f.write(struct.pack("<I", out_dim))
+    f.write(struct.pack("<I", group_size))
+    f.write(struct.pack(f"<{len(scales)}f", *scales))
     f.write(packed)
 
 
@@ -121,8 +148,11 @@ def main():
             if is_q4(name):
                 if tensor.dim() != 2:
                     raise ValueError(f"Se esperaba tensor 2D para {name}, tiene {tensor.dim()}D")
+                out_dim = tensor.shape[0]
+                gsize = choose_group_size(out_dim)
+                num_groups = (out_dim + gsize - 1) // gsize
                 write_q4_tensor(f, name, tensor)
-                print(f"[Q4 ]  {name:50s} shape={tuple(tensor.shape)}")
+                print(f"[Q4 ]  {name:50s} shape={tuple(tensor.shape)}  group_size={gsize} num_groups={num_groups}")
             else:
                 write_f32_tensor(f, name, tensor)
                 print(f"[F32]  {name:50s} shape={tuple(tensor.shape)}")

@@ -30,10 +30,17 @@ size_t max_activation_bytes = 0;
 // termina siendo arrastrado por los outliers de toda la matriz.
 struct TensorQ4 {
     std::string name;
-    uint32_t size;              // cantidad total de parametros (rows * in_dim)
-    uint32_t rows;               // out_dim: cantidad de filas / cantidad de scales
-    std::vector<float> scales;   // un scale por fila, tamaño == rows
+    uint32_t size;              // cantidad total de parametros (out_dim * in_dim)
+    uint32_t out_dim;            // cantidad de filas de la matriz
+    uint32_t group_size;         // cuantas filas consecutivas comparten un scale
+    std::vector<float> scales;   // tamaño == ceil(out_dim / group_size)
     std::vector<uint8_t> data;   // 2 pesos por byte, empaquetados fila por fila
+
+    // Para matrices chicas (q/k/v/out_proj, mlp: 64-256 filas) group_size=1,
+    // o sea scale por fila real, igual que antes.
+    // Para matrices enormes (wte/lm_head: 50257 filas) group_size>1, para no
+    // pagar 50257 floats de overhead por un beneficio marginal fila-a-fila.
+    inline float scale_for_row(uint32_t o) const { return scales[o / group_size]; }
 };
 
 // TensorF32: usado para bias y parametros de LayerNorm (gamma/beta).
@@ -87,7 +94,7 @@ void linear_int4(const std::vector<float>& input, const TensorQ4& weight, const 
 
     for (int o = 0; o < out_dim; ++o) {
         int32_t acc = 0;
-        float w_scale = weight.scales[o]; // scale propio de esta fila
+        float w_scale = weight.scale_for_row(o); // scale del grupo al que pertenece esta fila
 
         for (int i = 0; i < in_dim; i += 2) {
             int data_index = (o * in_dim + i) / 2;
@@ -195,8 +202,9 @@ TensorF32 find_f32_tensor(const std::vector<TensorF32>& weights, const std::stri
 //   uint8  type            (0 = Q4 por-fila, 1 = F32 plano)
 //   uint32 total_size       (cantidad de elementos)
 //   -- si type == 0 (Q4):
-//        uint32 rows              (out_dim, cantidad de scales)
-//        float  scales[rows]
+//        uint32 out_dim            (cantidad de filas de la matriz)
+//        uint32 group_size         (filas consecutivas por scale)
+//        float  scales[ceil(out_dim / group_size)]
 //        uint8  data[ceil(total_size/2)]   (packed, 2 valores por byte)
 //   -- si type == 1 (F32):
 //        float  data[total_size]
@@ -229,15 +237,18 @@ GPTNeoModel load_model(const std::string& filename, size_t& total_bytes) {
             t.name = name;
             t.size = total_size;
 
-            file.read(reinterpret_cast<char*>(&t.rows), sizeof(t.rows));
-            t.scales.resize(t.rows);
-            file.read(reinterpret_cast<char*>(t.scales.data()), t.rows * sizeof(float));
+            file.read(reinterpret_cast<char*>(&t.out_dim), sizeof(t.out_dim));
+            file.read(reinterpret_cast<char*>(&t.group_size), sizeof(t.group_size));
+
+            uint32_t num_groups = (t.out_dim + t.group_size - 1) / t.group_size;
+            t.scales.resize(num_groups);
+            file.read(reinterpret_cast<char*>(t.scales.data()), num_groups * sizeof(float));
 
             uint32_t packed_size = (t.size + 1) / 2;
             t.data.resize(packed_size);
             file.read(reinterpret_cast<char*>(t.data.data()), packed_size);
 
-            total_bytes += packed_size + t.rows * sizeof(float);
+            total_bytes += packed_size + num_groups * sizeof(float);
             q4_weights.push_back(t);
         } else {
             TensorF32 t;
@@ -284,9 +295,10 @@ int forward_token(GPTNeoModel& model, int token_id, int pos, KVCache& cache, con
     total_mac_ops_per_token = 0;
     std::vector<float> x(HIDDEN_SIZE, 0.0f);
 
-    // wte y wpe ahora tienen scale por fila (una fila = un token / una posicion)
-    float wte_scale = model.wte.scales[token_id];
-    float wpe_scale = model.wpe.scales[pos];
+    // wte y wpe usan scale por grupo (grupo = varios tokens/posiciones consecutivas
+    // compartiendo un scale, para no pagar 50257 floats de overhead en wte)
+    float wte_scale = model.wte.scale_for_row(token_id);
+    float wpe_scale = model.wpe.scale_for_row(pos);
 
     for (int i = 0; i < HIDDEN_SIZE; ++i) {
         uint8_t packed_wte = model.wte.data[(token_id * HIDDEN_SIZE + i) / 2];
