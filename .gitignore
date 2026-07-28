@@ -1,0 +1,6 @@
+/venv
+*.bin
+Inf
+inference
+info
+*.txt
