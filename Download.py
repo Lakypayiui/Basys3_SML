@@ -1,84 +1,134 @@
-import torch
+"""
+Re-cuantiza TinyStories-1M (GPT-Neo) al nuevo formato binario esperado
+por el main.cpp corregido:
+
+  - Matrices de pesos que participan en matmuls (embeddings, q/k/v/out_proj,
+    mlp_fc, mlp_proj, lm_head): INT4 empaquetado, CON UN SCALE POR FILA
+    (out_dim scales en vez de 1 global).
+  - Bias y parametros de LayerNorm (ln_1, ln_2, ln_f, out_proj.bias,
+    mlp.c_fc.bias, mlp.c_proj.bias): FP32 plano, sin cuantizar.
+
+Requiere: pip install torch transformers
+
+Formato de salida (tinystories_1m_q4.bin):
+  uint32 magic
+  por cada tensor:
+    uint32 name_len; char name[name_len]
+    uint8  type            (0 = Q4 por-fila, 1 = F32 plano)
+    uint32 total_size       (cantidad de elementos)
+    -- si type == 0:
+         uint32 rows              (out_dim, cantidad de scales)
+         float  scales[rows]
+         uint8  data[ceil(total_size/2)]   (2 valores por byte, nibble bajo = indice par)
+    -- si type == 1:
+         float  data[total_size]
+"""
+
 import struct
-import json
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import numpy as np
+import torch
+from transformers import AutoModelForCausalLM
 
-def export_model_and_vocab():
-    model_name = "roneneldan/TinyStories-1M"
-    tokenizer_name = "EleutherAI/gpt-neo-125M" # Base usada para TinyStories
-    
-    print(f"1. Descargando el tokenizador desde Hugging Face...")
-    # El tokenizador se descarga y cachea localmente
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    print("2. Exportando vocabulario a vocab.txt para C++...")
-    vocab = tokenizer.get_vocab()
-    # Ordenar por el ID del token para que el indice coincida con la linea del archivo
-    sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
-    
-    with open("vocab.txt", "w", encoding="utf-8") as f:
-        for word, idx in sorted_vocab:
-            # Limpiamos saltos de linea nativos para no romper el parser en C++
-            clean_word = word.replace('\n', '\\n').replace('\r', '\\r')
-            f.write(f"{clean_word}\n")
-    print(f"   -> Vocabulario guardado ({len(sorted_vocab)} tokens).")
+MAGIC = 0x54494E31  # "TIN1"
 
-    print(f"\n3. Descargando los pesos de {model_name}...")
-    # Descarga de la red neuronal a la memoria RAM
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+# Tensores que son matrices de pesos usadas en matmul -> cuantizar Q4 por fila.
+# Todo lo demas (bias, layernorm) se guarda en F32 plano.
+Q4_NAME_SUFFIXES = (
+    "wte.weight",
+    "wpe.weight",
+    "q_proj.weight",
+    "k_proj.weight",
+    "v_proj.weight",
+    "out_proj.weight",
+    "c_fc.weight",
+    "c_proj.weight",
+    "lm_head.weight",
+)
+
+
+def is_q4(name: str) -> bool:
+    return any(name.endswith(suf) for suf in Q4_NAME_SUFFIXES)
+
+
+def quantize_row_int4(row: torch.Tensor):
+    """Cuantiza un vector 1D a INT4 con signo [-8, 7], devuelve (scale, valores_int8)."""
+    max_abs = row.abs().max().item()
+    scale = (max_abs / 7.0) if max_abs > 0 else 1.0
+    q = torch.round(row / scale).clamp(-8, 7).to(torch.int8)
+    return scale, q
+
+
+def pack_int4(rows_q: torch.Tensor):
+    """rows_q: tensor 2D [out_dim, in_dim] de valores int8 en [-8,7].
+    Empaqueta 2 valores por byte, low-nibble = indice par, high-nibble = indice impar,
+    recorriendo fila por fila (mismo layout que espera linear_int4 en el C++)."""
+    flat = rows_q.flatten().tolist()
+    packed = bytearray((len(flat) + 1) // 2)
+    for idx, val in enumerate(flat):
+        byte_idx = idx // 2
+        nibble = val & 0x0F  # complemento a 2 de 4 bits
+        if idx % 2 == 0:
+            packed[byte_idx] = (packed[byte_idx] & 0xF0) | nibble
+        else:
+            packed[byte_idx] = (packed[byte_idx] & 0x0F) | (nibble << 4)
+    return bytes(packed)
+
+
+def write_q4_tensor(f, name: str, weight_2d: torch.Tensor):
+    """weight_2d: [out_dim, in_dim] en FP32. Cuantiza CADA FILA con su propio scale."""
+    out_dim, in_dim = weight_2d.shape
+    scales = []
+    quantized_rows = []
+    for o in range(out_dim):
+        scale, q_row = quantize_row_int4(weight_2d[o])
+        scales.append(scale)
+        quantized_rows.append(q_row)
+    q_all = torch.stack(quantized_rows, dim=0)  # [out_dim, in_dim]
+    packed = pack_int4(q_all)
+
+    name_bytes = name.encode("utf-8")
+    f.write(struct.pack("<I", len(name_bytes)))
+    f.write(name_bytes)
+    f.write(struct.pack("<B", 0))  # type = 0 (Q4)
+    total_size = out_dim * in_dim
+    f.write(struct.pack("<I", total_size))
+    f.write(struct.pack("<I", out_dim))  # rows = cantidad de scales
+    f.write(struct.pack(f"<{out_dim}f", *scales))
+    f.write(packed)
+
+
+def write_f32_tensor(f, name: str, tensor_1d: torch.Tensor):
+    flat = tensor_1d.flatten().tolist()
+    name_bytes = name.encode("utf-8")
+    f.write(struct.pack("<I", len(name_bytes)))
+    f.write(name_bytes)
+    f.write(struct.pack("<B", 1))  # type = 1 (F32)
+    f.write(struct.pack("<I", len(flat)))
+    f.write(struct.pack(f"<{len(flat)}f", *flat))
+
+
+def main():
+    print("Cargando roneneldan/TinyStories-1M...")
+    model = AutoModelForCausalLM.from_pretrained("roneneldan/TinyStories-1M")
     state_dict = model.state_dict()
-    
-    output_file = "tinystories_1m_q4.bin"
-    print(f"\n4. Iniciando cuantizacion INT4 y empaquetado binario...")
-    
-    with open(output_file, 'wb') as f:
-        # Magic number para que C++ sepa que esta leyendo el archivo correcto
-        f.write(struct.pack('I', 0x42494E31)) 
-        
-        total_params = 0
-        total_bytes = 0
-        
-        for name, tensor in state_dict.items():
-            # Convertir a float32 y aplanar el tensor a 1D
-            w = tensor.detach().cpu().float().numpy().flatten()
-            total_params += w.size
-            
-            # 1. Calcular factor de escala para INT4 (rango -8 a 7)
-            max_val = max(abs(w.max()), abs(w.min()))
-            scale = max_val / 7.0 if max_val > 0 else 1.0
-            
-            # 2. Cuantizar a INT4 y castear a int8 temporalmente
-            w_int4 = (w / scale).round().clip(-8, 7).astype(np.int8)
-            
-            # Si el tensor es impar, agregamos un 0 de relleno para poder empaquetar en pares
-            if w_int4.size % 2 != 0:
-                w_int4 = np.append(w_int4, [0]).astype(np.int8)
-            
-            # 3. Empaquetar 2 valores INT4 en 1 byte (uint8)
-            # Aplicamos mascara 0x0F (00001111) para limpiar los bits de signo en negativos
-            val0 = w_int4[0::2] & 0x0F
-            val1 = w_int4[1::2] & 0x0F
-            
-            # Bitshift de 4 posiciones para el segundo valor y operacion OR
-            w_packed = np.bitwise_or(val0, np.left_shift(val1, 4)).astype(np.uint8)
-            
-            # 4. Guardar en el binario:
-            name_bytes = name.encode('utf-8')
-            f.write(struct.pack('I', len(name_bytes)))    
-            f.write(name_bytes)                           
-            f.write(struct.pack('I', w.size)) # Mantenemos el tamano original de parametros
-            f.write(struct.pack('f', scale))              
-            f.write(w_packed.tobytes()) # Escribimos la mitad de los bytes
-            
-            total_bytes += (4 + len(name_bytes) + 4 + 4 + w_packed.nbytes)
-            print(f"   -> Capa: {name: <40} | Escala: {scale:.6f} | Bytes: {w_packed.nbytes}")
 
-    print("-" * 50)
-    print(f"EXITO: Procesamiento completado.")
-    print(f"Parametros empaquetados: {total_params:,}")
-    print(f"Tamano final en disco:   {total_bytes / (1024*1024):.2f} MB")
-    print(f"Archivos generados:      {output_file}, vocab.txt")
+    out_path = "tinystories_1m_q4.bin"
+    with open(out_path, "wb") as f:
+        f.write(struct.pack("<I", MAGIC))
+
+        for name, tensor in state_dict.items():
+            tensor = tensor.detach().to(torch.float32)
+
+            if is_q4(name):
+                if tensor.dim() != 2:
+                    raise ValueError(f"Se esperaba tensor 2D para {name}, tiene {tensor.dim()}D")
+                write_q4_tensor(f, name, tensor)
+                print(f"[Q4 ]  {name:50s} shape={tuple(tensor.shape)}")
+            else:
+                write_f32_tensor(f, name, tensor)
+                print(f"[F32]  {name:50s} shape={tuple(tensor.shape)}")
+
+    print(f"\nListo -> {out_path}")
+
 
 if __name__ == "__main__":
-    export_model_and_vocab()
+    main()
