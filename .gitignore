@@ -5,3 +5,4 @@ inference
 info
 *.txt
 tets.py
+*.DS_Store
