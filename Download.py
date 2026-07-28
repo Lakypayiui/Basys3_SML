@@ -52,7 +52,8 @@ Q4_NAME_SUFFIXES = (
     "out_proj.weight",
     "c_fc.weight",
     "c_proj.weight",
-    "lm_head.weight",
+    # lm_head.weight NO esta en esta lista: esta tied a wte.weight y se
+    # skipea explicitamente mas abajo antes de llegar a is_q4().
 )
 
 
@@ -143,6 +144,13 @@ def main():
         f.write(struct.pack("<I", MAGIC))
 
         for name, tensor in state_dict.items():
+            # lm_head.weight esta tied a transformer.wte.weight en GPT-Neo
+            # (tie_word_embeddings=True por defecto). Son el mismo tensor;
+            # guardarlo de nuevo duplicaria ~1.5MB de datos identicos.
+            if name == "lm_head.weight":
+                print(f"[SKIP] {name:50s} (tied a transformer.wte.weight, no se duplica)")
+                continue
+
             tensor = tensor.detach().to(torch.float32)
 
             if is_q4(name):

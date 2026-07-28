@@ -8,6 +8,8 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <cstring>
+#include <cstdint>
 
 // --- CONFIGURACION DE TINYSTORIES-1M ---
 const int VOCAB_SIZE = 50257;
@@ -70,18 +72,77 @@ struct GPTNeoModel {
     TensorQ4 wpe;
     std::vector<Block> blocks;
     TensorF32 ln_f_weight, ln_f_bias;
-    TensorQ4 lm_head;
+    // No hay lm_head propio: esta tensor esta tied a wte (tie_word_embeddings=True
+    // en GPT-Neo), asi que la proyeccion final reutiliza wte directamente. Ahorra
+    // ~1.5MB de datos que serian identicos si se guardaran por separado.
 };
 
 struct LayerCache {
-    std::vector<std::vector<float>> k_past;
-    std::vector<std::vector<float>> v_past;
+    std::vector<std::vector<uint16_t>> k_past; // FP16, no FP32
+    std::vector<std::vector<uint16_t>> v_past; // FP16, no FP32
 };
 
 struct KVCache {
     std::vector<LayerCache> layers;
     KVCache() : layers(NUM_LAYERS) {}
 };
+
+// --- CONVERSION FP32 <-> FP16 (IEEE 754 binary16) ---
+// Usado para el KV-cache: guardarlo en 16 bits en vez de 32 reduce a la mitad
+// el BRAM que ocupa, y es ademas el formato natural para representar en
+// Verilog (un registro de 16 bits) en la futura migracion a RTL.
+
+uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFF;
+
+    if (((x >> 23) & 0xFF) == 0xFF) {
+        // Inf o NaN
+        return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x200 : 0));
+    }
+    if (exp <= 0) {
+        // Demasiado chico para un half normalizado -> flush to zero
+        return static_cast<uint16_t>(sign);
+    }
+    if (exp >= 31) {
+        // Overflow -> infinito
+        return static_cast<uint16_t>(sign | 0x7C00);
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+float half_to_float(uint16_t h) {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign; // cero
+        } else {
+            // denormal de half -> normalizar
+            exp = 127 - 15 + 1;
+            while (!(mant & 0x400)) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+            f = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13); // inf/nan
+    } else {
+        f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+
+    float result;
+    std::memcpy(&result, &f, sizeof(result));
+    return result;
+}
 
 // --- OPERACIONES MATEMATICAS FUNDAMENTALES (INT4 por fila) ---
 
@@ -285,7 +346,8 @@ GPTNeoModel load_model(const std::string& filename, size_t& total_bytes) {
     }
     model.ln_f_weight = find_f32_tensor(f32_weights, "transformer.ln_f.weight");
     model.ln_f_bias = find_f32_tensor(f32_weights, "transformer.ln_f.bias");
-    model.lm_head = find_q4_tensor(q4_weights, "lm_head.weight");
+    // lm_head.weight no se carga: esta tied a wte, se reutiliza model.wte
+    // directamente en el forward pass (ver forward_token).
 
     return model;
 }
@@ -326,8 +388,14 @@ int forward_token(GPTNeoModel& model, int token_id, int pos, KVCache& cache, con
         linear_int4(x, block.k_proj_w, nullptr, k, HIDDEN_SIZE, HIDDEN_SIZE);
         linear_int4(x, block.v_proj_w, nullptr, v, HIDDEN_SIZE, HIDDEN_SIZE);
 
-        layer_cache.k_past.push_back(k);
-        layer_cache.v_past.push_back(v);
+        // El cache guarda K/V en FP16: convertimos antes de empujar.
+        std::vector<uint16_t> k_half(HIDDEN_SIZE), v_half(HIDDEN_SIZE);
+        for (int i = 0; i < HIDDEN_SIZE; ++i) {
+            k_half[i] = float_to_half(k[i]);
+            v_half[i] = float_to_half(v[i]);
+        }
+        layer_cache.k_past.push_back(k_half);
+        layer_cache.v_past.push_back(v_half);
 
         int current_seq_len = layer_cache.k_past.size();
         std::vector<float> attn_out(HIDDEN_SIZE, 0.0f);
@@ -339,7 +407,7 @@ int forward_token(GPTNeoModel& model, int token_id, int pos, KVCache& cache, con
             for (int t_past = 0; t_past < current_seq_len; ++t_past) {
                 float dot = 0.0f;
                 for (int d = 0; d < HEAD_DIM; ++d) {
-                    dot += q[head_offset + d] * layer_cache.k_past[t_past][head_offset + d];
+                    dot += q[head_offset + d] * half_to_float(layer_cache.k_past[t_past][head_offset + d]);
                 }
                 scores[t_past] = dot / std::sqrt(static_cast<float>(HEAD_DIM));
                 total_mac_ops_per_token += HEAD_DIM;
@@ -349,7 +417,7 @@ int forward_token(GPTNeoModel& model, int token_id, int pos, KVCache& cache, con
 
             for (int t_past = 0; t_past < current_seq_len; ++t_past) {
                 for (int d = 0; d < HEAD_DIM; ++d) {
-                    attn_out[head_offset + d] += scores[t_past] * layer_cache.v_past[t_past][head_offset + d];
+                    attn_out[head_offset + d] += scores[t_past] * half_to_float(layer_cache.v_past[t_past][head_offset + d]);
                     total_mac_ops_per_token += 1;
                 }
             }
@@ -374,7 +442,9 @@ int forward_token(GPTNeoModel& model, int token_id, int pos, KVCache& cache, con
 
     layer_norm(x, model.ln_f_weight, model.ln_f_bias);
     std::vector<float> logits(VOCAB_SIZE);
-    linear_int4(x, model.lm_head, nullptr, logits, HIDDEN_SIZE, VOCAB_SIZE);
+    // lm_head esta tied a wte: la misma matriz [VOCAB_SIZE, HIDDEN_SIZE] que se usa
+    // para el embedding de entrada se reutiliza aca como matriz de proyeccion de salida.
+    linear_int4(x, model.wte, nullptr, logits, HIDDEN_SIZE, VOCAB_SIZE);
 
     float penalty = 1.2f;
     for (int past_token : context_history) {
@@ -480,13 +550,13 @@ int main() {
     }
 
     size_t kv_elements = tokens.size() * NUM_LAYERS * 2 * HIDDEN_SIZE;
-    size_t kv_bytes_fp32 = kv_elements * 4;
+    size_t kv_bytes_fp16 = kv_elements * sizeof(uint16_t);
 
     std::cout << "\n\n========================================" << std::endl;
     std::cout << "  REPORTE FINAL DE EJECUCION (TOP-K INT4)" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "[BRAM] Peak Activations Buffer : " << max_activation_bytes << " Bytes" << std::endl;
-    std::cout << "[BRAM] KV Cache Final Size     : " << kv_bytes_fp32 << " Bytes (en FP32)" << std::endl;
+    std::cout << "[BRAM] KV Cache Final Size     : " << kv_bytes_fp16 << " Bytes (en FP16)" << std::endl;
     std::cout << "[COMPUTE] MAC Ops por Token    : " << total_mac_ops_per_token << " operaciones" << std::endl;
     if (generated_count > 0) {
         std::cout << "[PERF] Velocidad Media Host    : " << (1000.0 / (total_gen_time / generated_count)) << " tok/s (" << (total_gen_time / generated_count) << " ms/tok)" << std::endl;
