@@ -18,11 +18,6 @@ budget is the central engineering problem of this project.
 
 ## Target Hardware: Digilent Basys 3
 
-The Basys 3 is an entry-level FPGA trainer board built around a Xilinx
-(AMD) Artix-7 FPGA. It was chosen for this project because it's an
-accessible, low-cost platform for exploring embedded/edge inference — not
-because it's well-suited for it out of the box.
-
 | Component | Specification |
 |---|---|
 | FPGA | Xilinx/AMD Artix-7, part number `XC7A35T-1CPG236C` |
@@ -32,140 +27,177 @@ because it's well-suited for it out of the box.
 | Clock management | 5 clock management tiles, each with a PLL |
 | Internal clock speed | Exceeds 450 MHz (design-dependent) |
 | Non-volatile storage | 32 Mbit (4 MB) Quad-SPI NOR Flash (Spansion S25FL032 or Macronix MX25L3233F, depending on unit) |
-| Onboard I/O | 16 switches, 16 LEDs, 5 pushbuttons, 4-digit 7-segment display, 12-bit VGA, USB-UART bridge, USB HID host, 4 Pmod ports (3 standard 12-pin + 1 XADC/Pmod combo) |
+| Onboard I/O | 16 switches, 16 LEDs, 5 pushbuttons, 4-digit 7-segment display, 12-bit VGA, USB-UART bridge, USB HID host, 4 Pmod ports |
 | Toolchain | Xilinx/AMD Vivado Design Suite (WebPACK/Standard edition, free) |
 
 ### The real memory budget
 
 The 4 MB Quad-SPI Flash is shared with the FPGA's own configuration
-bitstream. An Artix-7 35T bitstream takes just over 2 MB, which leaves
-**roughly 48% of the flash — under ~2 MB — actually free for user data**
-such as model weights, once the design is deployed standalone (booting from
-Flash rather than staying loaded via JTAG). This is a hard constraint the
-project has to design around, on top of the more commonly cited "4 MB"
-figure. During the C++ proof-of-concept phase weights are loaded from a
-file on a host filesystem, so this limit isn't yet enforced — but it is the
-real ceiling the Verilog implementation will have to hit.
+bitstream (~2 MB for an Artix-7 35T), leaving **roughly ~2 MB actually free
+for user data** such as model weights in a standalone deployment (booting
+from Flash rather than staying tethered to JTAG). This is the real ceiling
+the Verilog implementation has to hit — not the commonly cited "4 MB"
+figure.
 
-The 1,800 Kbit (~225 KB) of BRAM is the other hard limit: it has to hold
-activation buffers, the KV-cache, and any weights or lookup tables the
-design chooses to keep resident on-chip during inference, all at once.
+The ~225 KB of BRAM is the other hard limit: it has to hold activation
+buffers, the KV-cache, and any weights or lookup tables kept resident
+on-chip during inference, all at once.
 
 ---
 
 ## Development Methodology: C++ First, Then Verilog
 
-Given the tight iteration loop needed to get quantization, numerical
-precision, and model behavior right, this project is being developed in
-**two deliberate stages**:
+### Stage 1 — C++ Proof of Concept (complete for current scope)
 
-### Stage 1 — C++ Proof of Concept (current stage)
+A bit-accurate software model of the target hardware datapath, run on a
+host machine, used to validate quantization and model behavior quickly
+before committing to RTL. INT4 weights (packed 2-per-byte), integer
+MAC accumulation, per-group weight scaling, and a full profiling harness
+(ROM/Flash footprint, peak BRAM usage, KV-cache size, MAC ops/token,
+tok/s) — all metrics that map directly onto Basys 3 resource budgets.
 
-A bit-accurate software model of the target hardware datapath is written in
-C++ and run on a regular host machine (no FPGA involved yet). This lets the
-architecture be validated and iterated on quickly:
+### Stage 2 — Verilog / RTL Port (in progress)
 
-- Model weights are quantized to **INT4**, packed 2 values per byte, mimicking
-  the storage format the FPGA's Flash/BRAM will actually hold.
-- All matrix multiplications are done with **integer accumulation** (INT4
-  weights × dynamically-quantized INT8 activations), the same arithmetic a
-  DSP-slice-based Verilog datapath would perform — not FP32 matmuls.
-- Per-group weight scaling, LayerNorm/bias precision, KV-cache sizing, and
-  attention/softmax behavior are all validated here first, where bugs are
-  cheap to find and fix (recompile in seconds vs. a full Vivado
-  synthesis/implementation run).
-- The C++ code also acts as a **profiling harness**: it reports ROM/Flash
-  footprint, peak activation (BRAM) usage, KV-cache size, MAC operations per
-  token, and generation speed — all metrics that map directly onto Basys 3
-  resource budgets (Flash capacity, BRAM capacity, DSP slice throughput).
-
-The explicit intent is that **every numerical operation in the C++ code is
-something that can be mapped 1:1 to a Verilog module** (a quantized linear
-layer → a MAC/accumulator unit with a weight ROM; LayerNorm → a small
-sequential arithmetic block; softmax/top-k → a comparator/sorting network),
-so no rethinking of the algorithm is needed at the RTL stage — only
-re-implementation of already-validated fixed-point arithmetic.
-
-### Stage 2 — Verilog / RTL Port (planned)
-
-Once the C++ model produces stable, coherent output within the target
-memory budget, the datapath will be re-implemented in Verilog for synthesis
-on the Basys 3:
-
-- INT4 weights loaded from Quad-SPI Flash into on-chip BRAM (or streamed,
-  depending on what fits).
-- Quantized MAC operations mapped onto the Artix-7's 90 DSP slices.
-- KV-cache and activation buffers implemented as BRAM-backed sequential
-  logic.
-- Control logic (layer sequencing, attention loop, top-k sampling) as a
-  small FSM, replacing the C++ `for` loops.
-- Token I/O via UART (leveraging the Basys 3's onboard USB-UART bridge) as
-  the simplest way to get generated text off the board during bring-up,
-  with the 7-segment display / LEDs as a fallback for basic status output.
-
-The C++ version remains the reference model throughout Stage 2 — Verilog
-simulation output is checked against it token-by-token to catch RTL bugs.
+Translating the validated C++ datapath into Verilog module by module,
+each validated in isolation before wiring into the full pipeline. This is
+now the active stage of the project.
 
 ---
 
-## Current Status (C++ Proof of Concept)
+## Current Status
 
-Latest run, after fixing a LayerNorm dequantization bug and moving to
-per-group INT4 weight scaling (capped at 512 scale groups per tensor, to
-keep the large embedding/output matrices affordable):
+### C++ reference model — memory budget solved
+
+Two optimizations closed the gap between the C++ model and the Basys 3's
+real Flash/BRAM budgets, both **with zero quality cost** (unlike
+quantization changes, which trade precision for size):
+
+1. **Weight tying (`wte` ↔ `lm_head`)**: GPT-Neo ties the input embedding
+   matrix and the output projection matrix by default — they are
+   literally the same tensor. The original C++/`.bin` format stored both
+   separately, duplicating ~1.5 MB of identical data. Storing it once:
+
+   ```
+   [ROM/Flash] Memoria de Pesos (Q4+F32) : 1.83 MB   (was 3.36 MB)
+   ```
+
+   This alone brought total weight storage from *over* the ~2 MB Flash
+   budget to comfortably *under* it.
+
+2. **KV-cache in FP16 instead of FP32**: halves KV-cache BRAM footprint
+   with negligible precision loss for this use case:
+
+   ```
+   [BRAM] KV Cache Final Size : 131072 Bytes (en FP16)   (was 262144 in FP32)
+   ```
+
+Latest full run:
 
 ```
-[ROM/Flash] Memoria de Pesos (Q4+F32) : 3.36 MB
-[INFO] Tiempo de carga en Host         : 77 ms
+[ROM/Flash] Memoria de Pesos (Q4+F32) : 1.83 MB
+[INFO] Tiempo de carga en Host         : 53 ms
 --- FASE DE PREFILL (4 tokens) ---
 --- GENERACION AUTOREGRESIVA ---
-Once upon a time she in a big, very good friends: "Jenny decided to value. Then Jill asked eyes for better next old man for thank you is brave and happy voice. Suddenly Daddy going will his wish about it he special that looks fun."
-That beautiful lber listened of the pictures could her family
+Once upon a time playing on an different singing and everyone could wiseer: maybe it it in value.
+The little down night she was brave that happy that what new friend wantedily decided very good wish for him lucky friend never what bad happened to find honeyman right now he had anything fun important he found something wonderful
 ========================================
   REPORTE FINAL DE EJECUCION (TOP-K INT4)
 ========================================
 [BRAM] Peak Activations Buffer : 201028 Bytes
-[BRAM] KV Cache Final Size     : 262144 Bytes (en FP32)
+[BRAM] KV Cache Final Size     : 131072 Bytes (en FP16)
 [COMPUTE] MAC Ops por Token    : 3675200 operaciones
-[PERF] Velocidad Media Host    : 21.87 tok/s (45.72 ms/tok)
+[PERF] Velocidad Media Host    : 21.17 tok/s (47.23 ms/tok)
 ========================================
 ```
 
-### Reading these numbers against the Basys 3 budget
+#### Budget check against the Basys 3
 
 | Metric | Value | Basys 3 constraint | Status |
 |---|---|---|---|
-| Weight storage (Q4 + F32) | 3.36 MB | ~2 MB free in Flash after bitstream | **Over budget** — needs further reduction |
-| Peak activation buffer | 201,028 Bytes | ~225 KB total BRAM | Tight — leaves very little BRAM for KV-cache and control logic |
-| KV-cache (FP32) | 262,144 Bytes | shares the same ~225 KB BRAM pool | **Over budget on its own** — will need INT8/INT4 KV-cache quantization |
-| Generation speed (host) | ~21.9 tok/s | N/A (host, not FPGA) | Reference only — expect this to change significantly (likely slower per-token, but possibly deeply pipelined) once ported to RTL |
+| Weight storage (Q4 + F32, tied embeddings) | 1.83 MB | ~2 MB free in Flash |  **Under budget** |
+| Peak activation buffer | 201,028 Bytes | ~225 KB total BRAM | Tight — still the largest single BRAM consumer (likely the 50257-entry logit vector; worth revisiting once the top-k module is built, e.g. an incremental top-k that never materializes the full vector) |
+| KV-cache (FP16) | 131,072 Bytes | shares the same ~225 KB BRAM pool | Halved, but **201 KB + 131 KB together still exceed ~225 KB** — see RTL note below, this reappears in `attention.v`'s per-layer instance budget |
+| Generation speed (host) | ~21.2 tok/s | N/A (host, not FPGA) | Reference only |
 
-### Output quality
+### Hardware bring-up — confirmed working on real Basys 3
 
-Text is now grammatically coherent in short spans — proper sentence
-structure, punctuation, and dialogue formatting are present — but still
-shows local corruption (`lber`, dropped/garbled words) consistent with
-remaining INT4 quantization error, most likely concentrated in the large
-`wte`/`lm_head` embedding matrices. This is being tracked as an open item
-for the next quantization iteration, weighed against the Flash budget
-above — every precision improvement here has a direct memory cost.
+The project has moved from "C++ only" to **real hardware verified on the
+board**:
+
+- **Menu / control FSM** (`top_fsm.v`): boot → connection banner → idle →
+  prefill → generate → done → regenerate-or-exit, with debounced buttons
+  (`btnC`/`btnU`/`btnD`) and a debounced physical reset (`btnR`).
+- **UART link to the PC, confirmed working end-to-end**: the board sends
+  `"Basys3 SML: connection OK"` over the USB-UART bridge (pin `A18`) at
+  startup, visible in a serial terminal (PuTTY/screen, 115200 8N1) on the
+  PC. Hit and fixed one real hardware bug along the way: an undebounced
+  physical reset button was causing mid-transmission resets that
+  corrupted the first UART bytes — same debounce pattern as the menu
+  buttons fixed it.
+- **`pc_listener.py`**: PC-side companion script. Works today in text
+  passthrough mode (shows the connection banner and any status text).
+  Also implements a token-ID mode (2-byte big-endian, vocab.txt lookup,
+  same `format_token()` logic as the C++) as the **contract the future
+  token-generation hardware needs to follow** — detokenization
+  deliberately lives on the PC, not in scarce Flash/BRAM.
+
+### RTL compute pipeline — modules built, arithmetic still pending
+
+The compute datapath is being built module-by-module, each mapped
+directly to a piece of the validated C++ reference:
+
+| Module | Purpose | Status |
+|---|---|---|
+| `top_fsm.v` | Menu / control FSM |  Working on hardware |
+| `uart_tx.v` | UART transmitter + fixed-string sender |  Working on hardware |
+| `sml_top.v` | Top-level integration (menu + UART) |  Working on hardware |
+| `flash_reader.v` | SPI Flash reader, **burst mode** (one header, many bytes) | Control logic complete; needs validation against Xilinx XAPP586 / a Digilent QSPI example before trusting the `STARTUPE2` usage on real hardware |
+| `quant_linear.v` | Quantized linear layer (`linear_int4()` equivalent) | Control flow + Flash addressing complete (burst reads for weights/scale/bias, group-scale caching); **float arithmetic still `TODO`**, pending Vivado's Floating-Point Operator IP |
+| `layer_norm.v` | LayerNorm, gamma/beta fetched from Flash in one burst each | Control flow complete; **float arithmetic + sqrt still `TODO`** |
+| `attention.v` | Multi-head attention + FP16 KV-cache | Control flow + KV-cache addressing complete; **FP16↔FP32 conversion is fully implemented** (pure bit manipulation, no float IP needed); **score/softmax/weighted-sum arithmetic still `TODO`** |
+| `topk_sampler.v` | Top-30 sampling over 50257 logits | Not yet built |
+| `token_forward.v` | Orchestrates one full token through all of the above | Not yet built |
+
+**Why the float arithmetic is still `TODO` everywhere**: comparing
+magnitudes, multiplying by scales, and summing biases all need Vivado's
+Floating-Point Operator IP (or an equivalent fixed-point redesign), and
+that's a single, shared piece of work that touches `quant_linear.v`,
+`layer_norm.v`, and `attention.v` simultaneously — deliberately deferred
+until the control-flow skeletons of all three were in place, to connect
+it once instead of three times.
+
+### A known BRAM conflict, surfaced by `attention.v`'s design
+
+`attention.v` needs its own KV-cache instance per transformer layer (all 8
+layers' histories must coexist across the whole generation, not just the
+current one). At `MAX_SEQ_LEN=128` that's 32 KB/layer × 8 layers = 256 KB
+— already over the ~225 KB total BRAM budget **before** counting the
+201 KB peak activation buffer. `MAX_SEQ_LEN=64` (the real max: 4 prefill +
+60 generated tokens) roughly halves that to 128 KB, which is the direct
+fix — flagged but not applied yet, pending a full BRAM budget pass once
+`token_forward.v` makes the real per-module allocation visible.
 
 ---
 
 ## Open Problems / Next Steps
 
-1. **Flash budget**: 3.36 MB of weights vs. ~2 MB of realistically free
-   Flash space is the single biggest blocker to a standalone (non-JTAG-tethered)
-   deployment. Candidate mitigations: weight tying between `wte` and
-   `lm_head` (if supported by this checkpoint, this alone would remove one
-   of the two largest tensors), more aggressive group quantization, or
-   accepting a smaller vocabulary.
-2. **KV-cache size**: currently FP32; needs to move to INT8 or INT4 to fit
-   inside the BRAM budget without starving activation buffers.
-3. **Output quality**: continue isolating remaining quantization error,
-   likely via targeted precision increases on the highest-impact tensors
-   only (not a blanket precision increase, which the Flash budget can't
-   absorb).
-4. **RTL port**: begin translating the validated C++ datapath into Verilog
-   once the above are resolved, starting with a single quantized linear
-   layer as the first testable module.
+1. **Connect the Floating-Point Operator IP** across `quant_linear.v`,
+   `layer_norm.v`, and `attention.v` — the single biggest remaining
+   correctness gap between "control flow looks right" and "produces real
+   numbers."
+2. **`flash_reader.v` hardware validation**: confirm the `STARTUPE2`-based
+   CCLK access against Xilinx's XAPP586 or a Digilent reference design
+   before relying on it for real reads.
+3. **BRAM budget pass**: resolve the `attention.v` KV-cache sizing
+   (`MAX_SEQ_LEN` 128→64) and revisit the 201 KB peak activation buffer
+   (likely the full logit vector — an incremental top-k that never
+   materializes all 50257 at once would help here too).
+4. **`topk_sampler.v`**: sequential top-30 scan + LFSR-based sampling over
+   the (tied) `wte`/`lm_head` projection.
+5. **`token_forward.v`**: the orchestrator tying every module above into
+   one full token forward pass, replacing the placeholder counters
+   currently driving `prefill_done`/`gen_done` in `sml_top.v`.
+6. **Flash throughput**: even in burst mode, `flash_reader.v` is single-line
+   SPI; Quad-SPI (4 data lines, ~4× throughput) is the next speed
+   optimization once correctness is confirmed, and matters most for the
+   tied `wte`/`lm_head` projection (50257 rows).
